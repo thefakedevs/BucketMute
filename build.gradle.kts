@@ -32,6 +32,11 @@ dependencies {
 }
 
 tasks {
+    shadowJar {
+        // Relocate kotlin to avoid conflicts
+        relocate("kotlin", "dev.baechka.svcmute.kotlin")
+    }
+
     runVelocity {
         // Configure the Velocity version for our task.
         // This is the only required configuration besides applying the plugin.

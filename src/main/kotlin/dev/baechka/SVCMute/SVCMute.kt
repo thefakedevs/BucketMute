@@ -4,18 +4,21 @@ import com.google.inject.Inject
 import com.velocitypowered.api.command.CommandSource
 import com.velocitypowered.api.command.SimpleCommand
 import com.velocitypowered.api.event.Subscribe
+import com.velocitypowered.api.event.player.ServerConnectedEvent
 import com.velocitypowered.api.event.proxy.ProxyInitializeEvent
 import com.velocitypowered.api.plugin.Dependency
 import com.velocitypowered.api.plugin.Plugin
 import com.velocitypowered.api.proxy.Player
 import com.velocitypowered.api.proxy.ProxyServer
 import com.velocitypowered.api.proxy.messages.MinecraftChannelIdentifier
+import com.velocitypowered.api.scheduler.ScheduledTask
 import net.kyori.adventure.text.Component
 import net.kyori.adventure.text.format.NamedTextColor
 import net.luckperms.api.LuckPermsProvider
 import org.slf4j.Logger
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 import java.util.function.BiConsumer
 
 @Plugin(
@@ -45,6 +48,9 @@ class SVCMute @Inject constructor(
 
     // Хранение мутов: UUID игрока -> время окончания мута (-1 = перманентный)
     private val mutedPlayers = ConcurrentHashMap<UUID, Long>()
+
+    // Задача для проверки истечения мутов
+    private var muteCheckTask: ScheduledTask? = null
 
     @Subscribe
     @Suppress("UNUSED_PARAMETER")
@@ -76,7 +82,68 @@ class SVCMute @Inject constructor(
             MuteListCommand(this)
         )
 
+
+        // Запускаем задачу проверки истечения мутов каждые 1 секунду
+        muteCheckTask = server.scheduler
+            .buildTask(this, Runnable { checkExpiredMutes() })
+            .repeat(1, TimeUnit.SECONDS)
+            .schedule()
+
         logger.info("SVCMute плагин успешно загружен!")
+    }
+
+    /**
+     * Обработчик события подключения игрока к серверу.
+     * Отправляем статус мута игроку при подключении к backend-серверу.
+     */
+    @Subscribe
+    fun onServerConnected(event: ServerConnectedEvent) {
+        val player = event.player
+        val uuid = player.uniqueId
+
+        // Небольшая задержка, чтобы клиент успел инициализироваться
+        server.scheduler.buildTask(this, Runnable {
+            if (isMuted(uuid)) {
+                logger.info("[SVCMute] Игрок ${player.username} подключился к серверу и замьючен, отправляем пакет")
+                sendMuteStatusToClient(uuid, true)
+                voicechatStateUpdater?.accept(uuid, true)
+            }
+        }).delay(1, TimeUnit.SECONDS).schedule()
+    }
+
+    /**
+     * Проверяет истёкшие муты и снимает их.
+     */
+    private fun checkExpiredMutes() {
+        val currentTime = System.currentTimeMillis()
+        val expiredMutes = mutableListOf<UUID>()
+
+        mutedPlayers.forEach { (uuid, endTime) ->
+            // Пропускаем перманентные муты
+            if (endTime != -1L && currentTime >= endTime) {
+                expiredMutes.add(uuid)
+            }
+        }
+
+        expiredMutes.forEach { uuid ->
+            logger.info("[SVCMute] Мут игрока $uuid истёк, снимаем автоматически")
+
+            // Удаляем из списка
+            mutedPlayers.remove(uuid)
+
+            // Обновляем состояние voicechat
+            voicechatStateUpdater?.accept(uuid, false)
+
+            // Отправляем пакет клиенту
+            sendMuteStatusToClient(uuid, false)
+
+            // Уведомляем игрока, если он онлайн
+            server.getPlayer(uuid).ifPresent { player ->
+                player.sendMessage(
+                    Component.text("Ваш мут в голосовом чате истёк. Микрофон включён!", NamedTextColor.GREEN)
+                )
+            }
+        }
     }
 
     // Callback для обновления состояния VoiceChat (устанавливается из SVCMuteVoicechatPlugin)
@@ -122,15 +189,19 @@ class SVCMute @Inject constructor(
             return
         }
 
+        logger.info("[SVCMute] Отправка пакета статуса мута игроку ${player.username}: muted=$muted")
+
         val status: Byte = if (muted) 0x01 else 0x00
         val data = byteArrayOf(status)
 
         // Пробуем отправить напрямую клиенту
         val sentToClient = player.sendPluginMessage(MUTE_STATUS_CHANNEL, data)
+        logger.info("[SVCMute] Отправка напрямую клиенту: $sentToClient")
 
         // Также отправляем через backend сервер (на случай если клиент не зарегистрировал канал напрямую)
         player.currentServer.ifPresent { serverConnection ->
             val sentToBackend = serverConnection.sendPluginMessage(MUTE_STATUS_CHANNEL, data)
+            logger.info("[SVCMute] Отправка через backend сервер: $sentToBackend")
         }
     }
 
