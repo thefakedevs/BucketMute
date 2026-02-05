@@ -61,7 +61,7 @@ group = mod_group_id
 version = "$mod_version-${getGitCommitHash()}"
 
 base {
-    archivesName.set(mod_id)
+    archivesName.set("svcmute-forge")
 }
 
 java {
