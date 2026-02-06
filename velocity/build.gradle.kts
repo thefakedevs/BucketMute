@@ -44,7 +44,22 @@ dependencies {
 
 tasks {
     shadowJar {
+        archiveClassifier.set("")
         relocate("kotlin", "dev.baechka.bucketmute.kotlin")
+        relocate("org.jetbrains", "dev.baechka.bucketmute.jetbrains")
+        manifest {
+            attributes["Main-Class"] = "dev.baechka.BucketMute.BucketMute"
+        }
+    }
+
+    jar {
+        manifest {
+            attributes["Main-Class"] = "dev.baechka.BucketMute.BucketMute"
+        }
+    }
+
+    build {
+        dependsOn(shadowJar)
     }
 
     runVelocity {
