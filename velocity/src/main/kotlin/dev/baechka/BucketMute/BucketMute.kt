@@ -39,12 +39,15 @@ class BucketMute @Inject constructor(
         lateinit var instance: BucketMute
             private set
 
+        private const val ADMIN_PERMISSION = "bucketmute.admin"
+
         val MUTE_STATUS_CHANNEL: MinecraftChannelIdentifier =
             MinecraftChannelIdentifier.create("bucketmute", "mute_status")
     }
 
     private val mutedPlayers = ConcurrentHashMap<UUID, Long>()
     private var muteCheckTask: ScheduledTask? = null
+    private var broadcastEnabled = false
 
     @JvmField
     var voicechatStateUpdater: BiConsumer<UUID, Boolean>? = null
@@ -73,6 +76,11 @@ class BucketMute @Inject constructor(
             MuteListCommand(this)
         )
 
+        server.commandManager.register(
+            server.commandManager.metaBuilder("bucketbroadcast").plugin(this).build(),
+            BroadcastCommand(this)
+        )
+
         muteCheckTask = server.scheduler
             .buildTask(this, Runnable { checkExpiredMutes() })
             .repeat(1, TimeUnit.SECONDS)
@@ -87,10 +95,7 @@ class BucketMute @Inject constructor(
         val uuid = player.uniqueId
 
         server.scheduler.buildTask(this, Runnable {
-            if (isMuted(uuid)) {
-                sendMuteStatusToClient(uuid, true)
-                voicechatStateUpdater?.accept(uuid, true)
-            }
+            updateMuteState(uuid)
         }).delay(1, TimeUnit.SECONDS).schedule()
     }
 
@@ -106,13 +111,14 @@ class BucketMute @Inject constructor(
 
         expiredMutes.forEach { uuid ->
             mutedPlayers.remove(uuid)
-            voicechatStateUpdater?.accept(uuid, false)
-            sendMuteStatusToClient(uuid, false)
+            updateMuteState(uuid)
 
             server.getPlayer(uuid).ifPresent { player ->
-                player.sendMessage(
-                    Component.text(Messages.get(player, "mute-expired"), NamedTextColor.GREEN)
-                )
+                if (!isEffectivelyMuted(uuid)) {
+                    player.sendMessage(
+                        Component.text(Messages.get(player, "mute-expired"), NamedTextColor.GREEN)
+                    )
+                }
             }
         }
     }
@@ -131,8 +137,7 @@ class BucketMute @Inject constructor(
     fun unmutePlayer(uuid: UUID): Boolean {
         val removed = mutedPlayers.remove(uuid) != null
         if (removed) {
-            voicechatStateUpdater?.accept(uuid, false)
-            sendMuteStatusToClient(uuid, false)
+            updateMuteState(uuid)
         }
         return removed
     }
@@ -159,6 +164,25 @@ class BucketMute @Inject constructor(
         return true
     }
 
+    fun isEffectivelyMuted(uuid: UUID): Boolean {
+        return isMuted(uuid) || (broadcastEnabled && !hasAdminPermission(uuid))
+    }
+
+    fun isBroadcastEnabled(): Boolean = broadcastEnabled
+
+    fun setBroadcastEnabled(enabled: Boolean) {
+        if (broadcastEnabled == enabled) return
+
+        broadcastEnabled = enabled
+        server.allPlayers.forEach { updateMuteState(it.uniqueId) }
+    }
+
+    fun updateMuteState(uuid: UUID) {
+        val muted = isEffectivelyMuted(uuid)
+        voicechatStateUpdater?.accept(uuid, muted)
+        sendMuteStatusToClient(uuid, muted)
+    }
+
     fun getMutedPlayers(): Map<UUID, Long> = mutedPlayers.toMap()
 
     fun getServer(): ProxyServer = server
@@ -173,6 +197,11 @@ class BucketMute @Inject constructor(
         } catch (_: Exception) {
             source.hasPermission(permission)
         }
+    }
+
+    fun hasAdminPermission(uuid: UUID): Boolean {
+        val player = server.getPlayer(uuid).orElse(null) ?: return false
+        return hasPermission(player, ADMIN_PERMISSION)
     }
 }
 
@@ -284,6 +313,67 @@ class MuteCommand(private val plugin: BucketMute) : SimpleCommand {
             seconds < 86400 -> player?.let { Messages.get(it, "time-hours", seconds / 3600) } ?: Messages.get("time-hours", seconds / 3600)
             else -> player?.let { Messages.get(it, "time-days", seconds / 86400) } ?: Messages.get("time-days", seconds / 86400)
         }
+    }
+}
+
+class BroadcastCommand(private val plugin: BucketMute) : SimpleCommand {
+
+    override fun execute(invocation: SimpleCommand.Invocation) {
+        val source = invocation.source()
+        val args = invocation.arguments()
+        val sourcePlayer = source as? Player
+
+        if (!plugin.hasPermission(source, "bucketmute.admin")) {
+            val msg = sourcePlayer?.let { Messages.get(it, "no-permission") } ?: Messages.get("no-permission")
+            source.sendMessage(Component.text(msg, NamedTextColor.RED))
+            return
+        }
+
+        if (args.isEmpty()) {
+            sendStatus(source, sourcePlayer)
+            return
+        }
+
+        when (args[0].lowercase()) {
+            "on", "enable", "enabled", "true" -> {
+                plugin.setBroadcastEnabled(true)
+                val msg = sourcePlayer?.let { Messages.get(it, "broadcast-enabled") } ?: Messages.get("broadcast-enabled")
+                source.sendMessage(Component.text(msg, NamedTextColor.GREEN))
+            }
+            "off", "disable", "disabled", "false" -> {
+                plugin.setBroadcastEnabled(false)
+                val msg = sourcePlayer?.let { Messages.get(it, "broadcast-disabled") } ?: Messages.get("broadcast-disabled")
+                source.sendMessage(Component.text(msg, NamedTextColor.GREEN))
+            }
+            "status" -> sendStatus(source, sourcePlayer)
+            else -> {
+                val msg = sourcePlayer?.let { Messages.get(it, "usage-broadcast") } ?: Messages.get("usage-broadcast")
+                source.sendMessage(Component.text(msg, NamedTextColor.YELLOW))
+            }
+        }
+    }
+
+    override fun suggestAsync(invocation: SimpleCommand.Invocation): java.util.concurrent.CompletableFuture<List<String>> {
+        val args = invocation.arguments()
+
+        return java.util.concurrent.CompletableFuture.supplyAsync {
+            if (args.size <= 1) {
+                val prefix = args.getOrElse(0) { "" }.lowercase()
+                listOf("on", "off", "status").filter { it.startsWith(prefix) }
+            } else {
+                emptyList()
+            }
+        }
+    }
+
+    private fun sendStatus(source: CommandSource, sourcePlayer: Player?) {
+        val key = if (plugin.isBroadcastEnabled()) {
+            "broadcast-status-enabled"
+        } else {
+            "broadcast-status-disabled"
+        }
+        val msg = sourcePlayer?.let { Messages.get(it, key) } ?: Messages.get(key)
+        source.sendMessage(Component.text(msg, NamedTextColor.YELLOW))
     }
 }
 
